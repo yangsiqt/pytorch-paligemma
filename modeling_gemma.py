@@ -1,3 +1,19 @@
+"""
+modeling_gemma.py - PaliGemma 模型的 Gemma 文本分支实现
+
+本文件实现了 PaliGemma 多模态大模型的文本/语言模型部分，包括：
+- KVCache: 自回归生成时的键值缓存，用于加速推理
+- GemmaConfig/PaliGemmaConfig: 模型配置类
+- GemmaRMSNorm: RMSNorm 归一化层（Gemma 特有）
+- GemmaRotaryEmbedding: 旋转位置编码 RoPE
+- GemmaMLP: 前馈神经网络（门控结构）
+- GemmaAttention: 多头自注意力（支持 GQA）
+- GemmaDecoderLayer/GemmaModel: 解码器层与完整 Gemma 模型
+- GemmaForCausalLM: 因果语言模型头
+- PaliGemmaMultiModalProjector: 视觉特征到文本空间的投影器
+- PaliGemmaForConditionalGeneration: 完整的图文条件生成模型
+"""
+
 import torch
 from torch import nn
 from typing import Optional, Tuple, List
@@ -5,17 +21,25 @@ from torch.nn import CrossEntropyLoss
 import math
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
 
+
 class KVCache():
+    """
+    键值缓存类，用于自回归生成时缓存每层 Attention 的 Key 和 Value，
+    避免重复计算已生成 token 的注意力，显著加速推理。
+    """
 
     def __init__(self) -> None:
-        self.key_cache: List[torch.Tensor] = []
-        self.value_cache: List[torch.Tensor] = []
+        # 每层一个 key 和 value 张量列表，按层索引
+        self.key_cache: List[torch.Tensor] = []   # 各层的 Key 缓存
+        self.value_cache: List[torch.Tensor] = [] # 各层的 Value 缓存
     
     def num_items(self) -> int:
+        """返回当前缓存的序列长度（已生成的 token 数）"""
         if len(self.key_cache) == 0:
             return 0
         else:
             # The shape of the key_cache is [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+            # key_cache 形状为 [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]，取 Seq_Len
             return self.key_cache[0].shape[-2]
 
     def update(
@@ -24,20 +48,27 @@ class KVCache():
         value_states: torch.Tensor,
         layer_idx: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """将新生成的 token 的 key/value 追加到对应层的缓存，返回更新后的完整 key/value"""
         if len(self.key_cache) <= layer_idx:
             # If we never added anything to the KV-Cache of this layer, let's create it.
+            # 该层尚未有缓存，直接添加
             self.key_cache.append(key_states)
             self.value_cache.append(value_states)
         else:
             # ... otherwise we concatenate the new keys with the existing ones.
             # each tensor has shape: [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+            # 在序列维度（dim=-2）上拼接新旧 key/value
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
 
         # ... and then we return all the existing keys + the new ones.
+        # 返回该层所有已有的 key/value 加上新生成的
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
+
 class GemmaConfig():
+    """Gemma 语言模型的配置类，定义词表、隐藏层、注意力头等超参数"""
+
 
     def __init__(
         self,
@@ -57,21 +88,23 @@ class GemmaConfig():
         **kwargs,
     ):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.head_dim = head_dim
-        self.num_key_value_heads = num_key_value_heads
-        self.rms_norm_eps = rms_norm_eps
-        self.rope_theta = rope_theta
-        self.attention_bias = attention_bias
-        self.attention_dropout = attention_dropout
-        self.pad_token_id = pad_token_id
+        self.vocab_size = vocab_size                    # 词表大小
+        self.max_position_embeddings = max_position_embeddings  # 最大序列长度
+        self.hidden_size = hidden_size                 # 隐藏层维度
+        self.intermediate_size = intermediate_size      # FFN 中间层维度
+        self.num_hidden_layers = num_hidden_layers      # 解码器层数
+        self.num_attention_heads = num_attention_heads  # 注意力头数
+        self.head_dim = head_dim                        # 每个头的维度
+        self.num_key_value_heads = num_key_value_heads   # KV 头数（GQA 时小于 Q 头数）
+        self.rms_norm_eps = rms_norm_eps               # RMSNorm 的 epsilon
+        self.rope_theta = rope_theta                    # RoPE 的 base
+        self.attention_bias = attention_bias            # 注意力是否使用 bias
+        self.attention_dropout = attention_dropout     # 注意力 dropout
+        self.pad_token_id = pad_token_id                # 填充 token id
 
 class PaliGemmaConfig():
+    """PaliGemma 多模态模型的整体配置，融合视觉与文本配置"""
+
 
     def __init__(
         self,
@@ -86,10 +119,10 @@ class PaliGemmaConfig():
         **kwargs,
     ):
         super().__init__()
-        self.ignore_index = ignore_index
-        self.image_token_index = image_token_index
+        self.ignore_index = ignore_index                # 损失计算时忽略的 label 索引
+        self.image_token_index = image_token_index      # 图片占位 token 的 id
         self.vocab_size = vocab_size
-        self.projection_dim = projection_dim
+        self.projection_dim = projection_dim            # 视觉到文本的投影维度
         self.hidden_size = hidden_size
         self.vision_config = vision_config
         self.is_encoder_decoder = False
@@ -101,35 +134,47 @@ class PaliGemmaConfig():
         self.text_config = GemmaConfig(**text_config, pad_token_id=pad_token_id)
         self.vocab_size = self.text_config.vocab_size
 
+        # 图片 patch 数量：(image_size/patch_size)^2
         self.text_config.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) ** 2
         self.vision_config.projection_dim = projection_dim
 
 
 class GemmaRMSNorm(nn.Module):
+    """
+    RMSNorm 归一化层，Gemma 使用 RMSNorm 而非 LayerNorm，
+    与 Llama 在数值实现上有细微差异（见注释中的 PR 说明）
+    """
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
+        self.weight = nn.Parameter(torch.zeros(dim))  # 可学习缩放参数
 
     def _norm(self, x):
+        """RMSNorm：x / sqrt(mean(x^2) + eps)"""
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
         output = self._norm(x.float())
         # Llama does x.to(float16) * w whilst Gemma is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
+        # Gemma 与 Llama 不同：(x*w).to(float16)，先乘再转类型
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
 
+
 class GemmaRotaryEmbedding(nn.Module):
+    """旋转位置编码 RoPE，为 Q/K 注入位置信息，支持外推"""
+
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
 
-        self.dim = dim # it is set to the head_dim
+        self.dim = dim # it is set to the head_dim（取值为 head_dim）
         self.max_position_embeddings = max_position_embeddings
         self.base = base
 
         # Calculate the theta according to the formula theta_i = base^(-2i/dim) where i = 0, 1, 2, ..., dim // 2
+        # theta_i = base^(-2i/dim)，i=0,1,...,dim//2
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
         self.register_buffer("inv_freq", tensor=inv_freq, persistent=False)
 
@@ -138,10 +183,12 @@ class GemmaRotaryEmbedding(nn.Module):
         # x: [bs, num_attention_heads, seq_len, head_size]
         self.inv_freq.to(x.device)
         # Copy the inv_freq tensor for batch in the sequence
+        # 将 inv_freq 按 batch 和序列维度扩展
         # inv_freq_expanded: [Batch_Size, Head_Dim // 2, 1]
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         # position_ids_expanded: [Batch_Size, 1, Seq_Len]
         position_ids_expanded = position_ids[:, None, :].float()
+        # MPS 设备上 autocast 可能出问题，回退到 CPU 计算
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
@@ -157,22 +204,33 @@ class GemmaRotaryEmbedding(nn.Module):
 
 
 def rotate_half(x):
+    """
+    为 RoPE 的 sin 部分构造 [-x2, x1, -x4, x3, ...] 的张量，
+    将最后一维分为前后两半并交换、取负后拼接
+    """
     # Build the [-x2, x1, -x4, x3, ...] tensor for the sin part of the positional encoding.
-    x1 = x[..., : x.shape[-1] // 2] # Takes the first half of the last dimension
-    x2 = x[..., x.shape[-1] // 2 :] # Takes the second half of the last dimension
+    x1 = x[..., : x.shape[-1] // 2] # Takes the first half of the last dimension 取最后一维的前半
+    x2 = x[..., x.shape[-1] // 2 :] # Takes the second half of the last dimension 取最后一维的后半
     return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim) # Add the head dimension
-    sin = sin.unsqueeze(unsqueeze_dim) # Add the head dimension
+    """对 Q、K 应用 RoPE：q' = q*cos + rotate_half(q)*sin，k 同理"""
+    cos = cos.unsqueeze(unsqueeze_dim) # Add the head dimension 增加头维度
+    sin = sin.unsqueeze(unsqueeze_dim) # Add the head dimension 增加头维度
     # Apply the formula (34) of the Rotary Positional Encoding paper.
+    # 应用 RoPE 论文公式 (34)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 
 class GemmaMLP(nn.Module):
+    """
+    Gemma 的 FFN：门控结构 down(gelu(gate(x)) * up(x))，
+    与标准 Transformer 的 FFN 不同，使用了 SiLU/GELU 门控
+    """
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -189,16 +247,29 @@ class GemmaMLP(nn.Module):
         # j = self.up_proj(x) # [Batch_Size, Seq_Len, Hidden_Size] -> [Batch_Size, Seq_Len, Intermediate_Size]
         # z = y * j # [Batch_Size, Seq_Len, Intermediate_Size]
         # z = self.down_proj(z) # [Batch_Size, Seq_Len, Intermediate_Size] -> [Batch_Size, Seq_Len, Hidden_Size]
+        # 等价于 down(gelu(gate(x)) * up(x))
         return self.down_proj(nn.functional.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
 
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    GQA 中将 KV 头重复以匹配 Q 头数量，
+    例如 8 个 KV 头重复成 32 个以对应 32 个 Q 头
+    """
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
+    # 在 KV 头维度上插入新维并扩展，实现头重复
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+
 class GemmaAttention(nn.Module):
+    """
+    Gemma 多头自注意力层，支持 GQA、RoPE、KV Cache，
+    使用因果掩码进行自回归生成
+    """
+
 
     def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
         super().__init__()
@@ -210,18 +281,18 @@ class GemmaAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads  # GQA 重复倍数
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
-        assert self.hidden_size % self.num_heads == 0            
+        assert self.hidden_size % self.num_heads == 0
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
-        self.rotary_emb = GemmaRotaryEmbedding(
+        self.rotary_emb = GemmaRotaryEmbedding(  # 旋转位置编码
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
@@ -258,13 +329,14 @@ class GemmaAttention(nn.Module):
             key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx)
 
         # Repeat the key and values to match the number of heads of the query
+        # GQA：将 KV 头重复以匹配 Q 头数
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         # Perform the calculation as usual, Q * K^T / sqrt(head_dim). Shape: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         assert attention_mask is not None
-        attn_weights = attn_weights + attention_mask
+        attn_weights = attn_weights + attention_mask  # 加上因果掩码（负无穷处 softmax 后为 0）
 
         # Apply the softmax
         # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
@@ -288,7 +360,10 @@ class GemmaAttention(nn.Module):
 
         return attn_output, attn_weights
 
+
 class GemmaDecoderLayer(nn.Module):
+    """Gemma 解码器单层：Pre-LN + 自注意力 + 残差 + Pre-LN + MLP + 残差"""
+
 
     def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
@@ -332,7 +407,10 @@ class GemmaDecoderLayer(nn.Module):
 
         return hidden_states
 
+
 class GemmaModel(nn.Module):
+    """Gemma 解码器主干：Embedding + N 层 DecoderLayer + 最终 LayerNorm"""
+
 
     def __init__(self, config: GemmaConfig):
         super().__init__()
@@ -359,7 +437,7 @@ class GemmaModel(nn.Module):
     ) -> torch.FloatTensor:
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = inputs_embeds
-        # [Batch_Size, Seq_Len, Hidden_Size]
+        # [Batch_Size, Seq_Len, Hidden_Size] - Gemma 对 embedding 乘以 sqrt(hidden_size) 进行缩放
         normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
         hidden_states = hidden_states * normalizer
 
@@ -378,7 +456,10 @@ class GemmaModel(nn.Module):
         # [Batch_Size, Seq_Len, Hidden_Size]
         return hidden_states
 
+
 class GemmaForCausalLM(nn.Module):
+    """带因果语言模型头的 Gemma，输出词表上的 logits"""
+
 
     def __init__(self, config):
         super().__init__()
@@ -391,6 +472,7 @@ class GemmaForCausalLM(nn.Module):
         return self.model.embed_tokens
     
     def tie_weights(self):
+        """权重共享：lm_head 与 embed_tokens 共用参数，减少参数量"""
         self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
@@ -412,7 +494,7 @@ class GemmaForCausalLM(nn.Module):
 
         hidden_states = outputs
         logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        logits = logits.float()  # 转为 float 以稳定 softmax 等计算
 
         return_data = {
             "logits": logits,
@@ -420,11 +502,18 @@ class GemmaForCausalLM(nn.Module):
 
         if kv_cache is not None:
             # Return the updated cache
+            # 返回更新后的 KV 缓存供下一轮生成使用
             return_data["kv_cache"] = kv_cache
 
         return return_data
 
+
 class PaliGemmaMultiModalProjector(nn.Module):
+    """
+    多模态投影器：将视觉编码器输出的特征投影到与文本隐藏维度一致的空间，
+    使图像 token 能与文本 token 在同一空间进行注意力计算
+    """
+
     def __init__(self, config: PaliGemmaConfig):
         super().__init__()
         self.linear = nn.Linear(config.vision_config.hidden_size, config.vision_config.projection_dim, bias=True)
@@ -460,27 +549,36 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         scaled_image_features = image_features / (self.config.hidden_size**0.5)
     
         # Combine the embeddings of the image tokens, the text tokens and mask out all the padding tokens.
+        # 合并图像 token、文本 token 的 embedding，并将 padding token 置零
         final_embedding = torch.zeros(batch_size, sequence_length, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
         # Shape: [Batch_Size, Seq_Len]. True for text tokens
+        # 文本 token 掩码，True 表示该位置为文本
         text_mask = (input_ids != self.config.image_token_index) & (input_ids != self.pad_token_id)
         # Shape: [Batch_Size, Seq_Len]. True for image tokens
+        # 图像 token 掩码
         image_mask = input_ids == self.config.image_token_index
         # Shape: [Batch_Size, Seq_Len]. True for padding tokens
+        # 填充 token 掩码
         pad_mask = input_ids == self.pad_token_id
 
         # We need to expand the masks to the embedding dimension otherwise we can't use them in torch.where
+        # 将掩码扩展到 embedding 维度以便在 torch.where 中使用
         text_mask_expanded = text_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
         pad_mask_expanded = pad_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
         image_mask_expanded = image_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
 
         # Add the text embeddings
+        # 在文本位置填入文本 embedding
         final_embedding = torch.where(text_mask_expanded, inputs_embeds, final_embedding)
         # Insert image embeddings. We can't use torch.where because the sequence length of scaled_image_features is not equal to the sequence length of the final embedding
+        # 按 image_mask 位置 scatter 填入图像特征（因图像序列长度与 input_ids 不同，不能用 torch.where）
         final_embedding = final_embedding.masked_scatter(image_mask_expanded, scaled_image_features)
         # Zero out padding tokens
+        # 将 padding 位置置零
         final_embedding = torch.where(pad_mask_expanded, torch.zeros_like(final_embedding), final_embedding)
 
         #### CREATE THE ATTENTION MASK ####
+        #### 构建注意力掩码 ####
 
         dtype, device = inputs_embeds.dtype, inputs_embeds.device
         min_dtype = torch.finfo(dtype).min
@@ -488,32 +586,40 @@ class PaliGemmaForConditionalGeneration(nn.Module):
     
         if kv_cache is None or kv_cache.num_items() == 0:
             # Do not mask any token, because we're in the prefill phase
+            # 预填充阶段：不掩码任何 token
             # This only works when we have no padding
+            # 仅当无 padding 时成立
             causal_mask = torch.full(
                 (batch_size, q_len, q_len), fill_value=0, dtype=dtype, device=device
             )
         else:
             # Since we are generating tokens, the query must be one single token
+            # 生成阶段：query 长度为 1
             assert q_len == 1
             kv_len = kv_cache.num_items() + q_len
-            # Also in this case we don't need to mask anything, since each query should be able to attend all previous tokens. 
+            # Also in this case we don't need to mask anything, since each query should be able to attend all previous tokens.
+            # 当前 query 可 attend 到之前所有 token，无需掩码
             # This only works when we have no padding
             causal_mask = torch.full(
                 (batch_size, q_len, kv_len), fill_value=0, dtype=dtype, device=device
             )
 
         # Add the head dimension
+        # 增加注意力头维度以匹配多头注意力
         # [Batch_Size, Q_Len, KV_Len] -> [Batch_Size, Num_Heads_Q, Q_Len, KV_Len]
         causal_mask = causal_mask.unsqueeze(1)
 
         if kv_cache is not None and kv_cache.num_items() > 0:
             # The position of the query is just the last position
+            # 当前 query 的位置即为序列末尾
             position_ids = attention_mask.cumsum(-1)[:, -1]
             if position_ids.dim() == 1:
                 position_ids = position_ids.unsqueeze(0)
         else:
             # Create a position_ids based on the size of the attention_mask
+            # 根据 attention_mask 构造 position_ids
             # For masked tokens, use the number 1 as position.
+            # 被 mask 的位置填 1
             position_ids = (attention_mask.cumsum(-1)).masked_fill_((attention_mask == 0), 1).to(device)
 
         return final_embedding, causal_mask, position_ids
@@ -527,21 +633,25 @@ class PaliGemmaForConditionalGeneration(nn.Module):
     ) -> Tuple:
 
         # Make sure the input is right-padded
+        # 确保输入右填充（本实现要求 attention_mask 全 1，即无 padding）
         assert torch.all(attention_mask == 1), "The input cannot be padded"
 
-        # 1. Extra the input embeddings
+        # 1. Extract the input embeddings
+        # 1. 获取文本 token 的 embedding
         # shape: (Batch_Size, Seq_Len, Hidden_Size)
         inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
 
         # 2. Merge text and images
+        # 2. 视觉编码并投影：图像 -> 视觉特征 -> 文本空间
         # [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embed_Dim]
         selected_image_feature = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Hidden_Size]
         image_features = self.multi_modal_projector(selected_image_feature)
 
         # Merge the embeddings of the text tokens and the image tokens
+        # 3. 合并图文 embedding 并构造 attention_mask、position_ids
         inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(image_features, inputs_embeds, input_ids, attention_mask, kv_cache)
-        
+
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,

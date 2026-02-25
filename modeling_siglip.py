@@ -1,8 +1,23 @@
+"""
+modeling_siglip.py - PaliGemma 的视觉编码器 SigLIP 实现
+
+本文件实现了 SigLIP 视觉编码器，用于将图像编码为 patch 序列特征，包括：
+- SiglipVisionConfig: 视觉模型配置
+- SiglipVisionEmbeddings: Patch 嵌入与位置编码
+- SiglipAttention: 多头自注意力（无因果掩码，Encoder 风格）
+- SiglipMLP: 前馈网络
+- SiglipEncoderLayer / SiglipEncoder: 编码器层与堆叠
+- SiglipVisionTransformer: 完整 ViT 结构
+- SiglipVisionModel: 对外视觉模型接口
+"""
+
 from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+
 class SiglipVisionConfig:
+    """SigLIP 视觉编码器的配置类"""
 
     def __init__(
         self,
@@ -20,19 +35,21 @@ class SiglipVisionConfig:
     ):
         super().__init__()
 
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
+        self.hidden_size = hidden_size              # 隐藏层/嵌入维度
+        self.intermediate_size = intermediate_size  # FFN 中间层维度
+        self.num_hidden_layers = num_hidden_layers  # 编码器层数
         self.num_attention_heads = num_attention_heads
-        self.num_channels = num_channels
-        self.patch_size = patch_size
-        self.image_size = image_size
+        self.num_channels = num_channels            # 输入图像通道数，通常为 3
+        self.patch_size = patch_size               # Patch 大小，如 16
+        self.image_size = image_size               # 输入图像尺寸，如 224
         self.attention_dropout = attention_dropout
         self.layer_norm_eps = layer_norm_eps
-        self.num_image_tokens = num_image_tokens
+        self.num_image_tokens = num_image_tokens   # 图像 patch 总数
 
 
 class SiglipVisionEmbeddings(nn.Module):
+    """将图像通过卷积切成 patch 并加上位置编码"""
+
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.config = config
@@ -40,17 +57,19 @@ class SiglipVisionEmbeddings(nn.Module):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
+        # 使用与 patch_size 相等的 kernel 和 stride，将图像切成非重叠 patch
         self.patch_embedding = nn.Conv2d(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
             stride=self.patch_size,
-            padding="valid", # This indicates no padding is added
+            padding="valid", # This indicates no padding is added 不添加 padding，保持 patch 非重叠
         )
 
-        self.num_patches = (self.image_size // self.patch_size) ** 2
+        self.num_patches = (self.image_size // self.patch_size) ** 2  # patch 总数
         self.num_positions = self.num_patches
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
+        # 位置 id 缓冲区，persistent=False 表示不参与 checkpoint 保存/加载
         self.register_buffer(
             "position_ids",
             torch.arange(self.num_positions).expand((1, -1)),
@@ -60,22 +79,25 @@ class SiglipVisionEmbeddings(nn.Module):
     def forward(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
         _, _, height, width = pixel_values.shape # [Batch_Size, Channels, Height, Width]
         # Convolve the `patch_size` kernel over the image, with no overlapping patches since the stride is equal to the kernel size
+        # 使用与 patch_size 同大的卷积核和步长，将图像切成非重叠 patch
         # The output of the convolution will have shape [Batch_Size, Embed_Dim, Num_Patches_H, Num_Patches_W]
         # where Num_Patches_H = height // patch_size and Num_Patches_W = width // patch_size
-        patch_embeds = self.patch_embedding(pixel_values)  
+        patch_embeds = self.patch_embedding(pixel_values)
         # [Batch_Size, Embed_Dim, Num_Patches_H, Num_Patches_W] -> [Batch_Size, Embed_Dim, Num_Patches]
         # where Num_Patches = Num_Patches_H * Num_Patches_W
-        embeddings = patch_embeds.flatten(2)
+        embeddings = patch_embeds.flatten(2)  # 展平空间维度
         # [Batch_Size, Embed_Dim, Num_Patches] -> [Batch_Size, Num_Patches, Embed_Dim]
         embeddings = embeddings.transpose(1, 2)
         # Add position embeddings to each patch. Each positional encoding is a vector of size [Embed_Dim]
+        # 为每个 patch 加上位置编码
         embeddings = embeddings + self.position_embedding(self.position_ids)
         # [Batch_Size, Num_Patches, Embed_Dim]
         return embeddings
 
 
 class SiglipAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """Multi-headed attention from 'Attention Is All You Need' paper
+    多头自注意力，Encoder 风格（无因果掩码，各 patch 可互相注意）"""
 
     def __init__(self, config):
         super().__init__()
@@ -83,7 +105,7 @@ class SiglipAttention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-        self.scale = self.head_dim**-0.5 # Equivalent to 1 / sqrt(self.head_dim)
+        self.scale = self.head_dim**-0.5 # Equivalent to 1 / sqrt(self.head_dim) 缩放因子，用于缩放注意力分数
         self.dropout = config.attention_dropout
 
         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
@@ -97,7 +119,7 @@ class SiglipAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
         # hidden_states: [Batch_Size, Num_Patches, Embed_Dim]
-        batch_size, seq_len, _ = hidden_states.size()
+        batch_size, seq_len, _ = hidden_states.size()  # seq_len 即 patch 数
         # query_states: [Batch_Size, Num_Patches, Embed_Dim]
         query_states = self.q_proj(hidden_states)
         # key_states: [Batch_Size, Num_Patches, Embed_Dim]
@@ -111,6 +133,7 @@ class SiglipAttention(nn.Module):
 
         value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         # Calculate the attention using the formula Q * K^T / sqrt(d_k). attn_weights: [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
+        # 计算注意力分数 Q*K^T/sqrt(d_k)
         attn_weights = (torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale)
 
         if attn_weights.size() != (batch_size, self.num_heads, seq_len, seq_len):
@@ -120,10 +143,13 @@ class SiglipAttention(nn.Module):
             )
 
         # Apply the softmax row-wise. attn_weights: [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
+        # 对每行做 softmax 得到注意力权重
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         # Apply dropout only during training
+        # 仅训练时应用 dropout
         attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
         # Multiply the attention weights by the value states. attn_output: [Batch_Size, Num_Heads, Num_Patches, Head_Dim]
+        # 注意力权重与 value 相乘得到输出
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (batch_size, self.num_heads, seq_len, self.head_dim):
@@ -132,9 +158,9 @@ class SiglipAttention(nn.Module):
                 f" {attn_output.size()}"
             )
         # [Batch_Size, Num_Heads, Num_Patches, Head_Dim] -> [Batch_Size, Num_Patches, Num_Heads, Head_Dim]
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.transpose(1, 2).contiguous()  # 将 head 维度换到 seq 后
         # [Batch_Size, Num_Patches, Num_Heads, Head_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        attn_output = attn_output.reshape(batch_size, seq_len, self.embed_dim)
+        attn_output = attn_output.reshape(batch_size, seq_len, self.embed_dim)  # 拼接头维度
         # [Batch_Size, Num_Patches, Embed_Dim]
         attn_output = self.out_proj(attn_output)
 
@@ -142,6 +168,8 @@ class SiglipAttention(nn.Module):
 
 
 class SiglipMLP(nn.Module):
+    """标准 ViT FFN：fc1 -> GELU -> fc2"""
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -152,6 +180,7 @@ class SiglipMLP(nn.Module):
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Intermediate_Size]
         hidden_states = self.fc1(hidden_states)
         # hidden_states: [Batch_Size, Num_Patches, Intermediate_Size]
+        # GELU 激活（tanh 近似）
         hidden_states = nn.functional.gelu(hidden_states, approximate="tanh")
         # [Batch_Size, Num_Patches, Intermediate_Size] -> [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = self.fc2(hidden_states)
@@ -160,6 +189,8 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipEncoderLayer(nn.Module):
+    """Encoder 单层：Pre-LN + 自注意力 + 残差 + Pre-LN + MLP + 残差"""
+
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -194,6 +225,8 @@ class SiglipEncoderLayer(nn.Module):
 
 
 class SiglipEncoder(nn.Module):
+    """堆叠 N 个 Encoder 层"""
+
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.config = config
@@ -217,6 +250,8 @@ class SiglipEncoder(nn.Module):
 
 
 class SiglipVisionTransformer(nn.Module):
+    """完整 SigLIP ViT：Patch 嵌入 -> Encoder -> LayerNorm"""
+
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.config = config
@@ -238,6 +273,7 @@ class SiglipVisionTransformer(nn.Module):
 
 
 class SiglipVisionModel(nn.Module):
+    """对外视觉模型封装，输出 patch 序列特征"""
 
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
